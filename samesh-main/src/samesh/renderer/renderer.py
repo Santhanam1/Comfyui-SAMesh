@@ -1,9 +1,16 @@
 import os
-# os.environ['PYOPENGL_PLATFORM'] = 'egl' # Commented out to allow fallback to default platform (e.g., WGL on Windows)
-os.environ['EGL_DEVICE_ID'] = '-1' # NOTE: necessary to not create GPU contention
+import sys
+
+# On Windows, purge EGL settings from os.environ so PyOpenGL falls back to native WGL
+if sys.platform == "win32" or os.name == "nt":
+    os.environ.pop("PYOPENGL_PLATFORM", None)
+    os.environ.pop("EGL_DEVICE_ID", None)
+else:
+    os.environ["PYOPENGL_PLATFORM"] = "egl"
+    os.environ["EGL_DEVICE_ID"] = "-1"
 
 ### START VOODOO ###
-# Dark encantation for disabling anti-aliasing in pyrender (if needed)
+# Dark incantation for disabling anti-aliasing in pyrender (if needed)
 import OpenGL.GL
 antialias_active = False
 old_gl_enable = OpenGL.GL.glEnable
@@ -38,11 +45,9 @@ def colormap_faces(faces, background=np.array([255, 255, 255])) -> Image.Image:
     """
     Given a face id map, color each face with a random color.
     """
-    #print(np.unique(faces, return_counts=True))
-    palette = RandomState(0).randint(0, 255, (np.max(faces + 2), 3)) # must init every time to get same colors
-    #print(palette)
+    palette = RandomState(0).randint(0, 255, (np.max(faces + 2), 3))
     palette[0] = background
-    image = palette[faces + 1, :].astype(np.uint8) # shift -1 to 0
+    image = palette[faces + 1, :].astype(np.uint8)
     return Image.fromarray(image)
 
 
@@ -59,11 +64,7 @@ DEFAULT_CAMERA_PARAMS = {'fov': 60, 'znear': 0.01, 'zfar': 16}
 
 
 class Renderer:
-    """
-    """
     def __init__(self, config: OmegaConf):
-        """
-        """
         self.config = config
         self.renderer = pyrender.OffscreenRenderer(*config.target_dim)
         self.shaders = {
@@ -74,11 +75,9 @@ class Renderer:
         }
 
     def set_object(self, source: Trimesh | Scene, smooth=False):
-        """
-        """
         if isinstance(source, Scene):
             self.tmesh = scene2mesh(source)
-            self.scene = pyrender.Scene(ambient_light=[1.0, 1.0, 1.0]) # RGB no direction
+            self.scene = pyrender.Scene(ambient_light=[1.0, 1.0, 1.0])
             for name, geom in source.geometry.items():
                 if name in source.graph:
                     pose, _ = source.graph[name]
@@ -94,7 +93,7 @@ class Renderer:
         else:
             raise ValueError(f'Invalid source type {type(source)}')
         
-        # rearrange mesh for faceid rendering
+        # Rearrange mesh for faceid rendering
         self.tmesh_faceid = duplicate_verts(self.tmesh)
         self.scene_faceid = pyrender.Scene(ambient_light=[1.0, 1.0, 1.0])
         self.scene_faceid.add(
@@ -102,14 +101,12 @@ class Renderer:
         )
 
     def set_camera(self, camera_params: dict = None):
-        """
-        """
         self.camera_params = camera_params or dict(DEFAULT_CAMERA_PARAMS)
         self.camera_params['yfov'] = self.camera_params.get('yfov', self.camera_params.pop('fov'))
         self.camera_params['yfov'] = self.camera_params['yfov'] * np.pi / 180.0
         self.camera = pyrender.PerspectiveCamera(**self.camera_params)
         
-        self.camera_node        = self.scene       .add(self.camera)
+        self.camera_node        = self.scene.add(self.camera)
         self.camera_node_faceid = self.scene_faceid.add(self.camera)
         
     def render(
@@ -117,14 +114,10 @@ class Renderer:
         pose: np.ndarray, 
         lightdir=np.array([0.0, 0.0, 1.0]), uv_map=False, interpolate_norms=True, blur_matte=False
     ) -> dict:
-        """
-        """
-        self.scene       .set_pose(self.camera_node       , pose)
+        self.scene.set_pose(self.camera_node, pose)
         self.scene_faceid.set_pose(self.camera_node_faceid, pose)
 
         def render(shader: str, scene):
-            """
-            """
             self.renderer._renderer._program_cache = self.shaders[shader]
             return self.renderer.render(scene)
         
@@ -135,26 +128,18 @@ class Renderer:
         raw_bcent, raw_depth = render('barycnt', self.scene_faceid)
 
         def render_norms(norms) -> np.ndarray:
-            """
-            """
             return np.clip((norms / 255.0 - 0.5) * 2, -1, 1)
 
         def render_depth(depth, offset=2.8, alpha=0.8) -> np.ndarray:
-            """
-            """
             return np.where(depth > 0, alpha * (1.0 - range_norm(depth, offset=offset)), 1)
 
         def render_faces(faces) -> np.ndarray:
-            """
-            """
             faces = faces.astype(np.int32)
             faces = faces[:, :, 0] * 65536 + faces[:, :, 1] * 256 + faces[:, :, 2]
-            faces[faces == (256 ** 3 - 1)] = -1 # set background to -1
+            faces[faces == (256 ** 3 - 1)] = -1
             return faces
 
         def render_bcent(bcent) -> np.ndarray:
-            """
-            """
             return np.clip(bcent / 255.0, 0, 1)
 
         def render_matte(
@@ -164,33 +149,22 @@ class Renderer:
             bcent,
             alpha=0.5, beta=0.25, gaussian_kernel_width=5, gaussian_sigma=1,
         ) -> np.ndarray:
-            """
-            """
-            interpolated_norms = norms.copy() # Start with original norms
-            if interpolate_norms: # NOTE requires process=True
+            interpolated_norms = norms.copy()
+            if interpolate_norms:
                 num_faces = self.tmesh.faces.shape[0]
-                # Create a mask for valid face indices (ignore -1 background and out-of-bounds)
                 valid_faces_mask = (faces >= 0) & (faces < num_faces)
                 
-                # Only process pixels with valid face indices
                 if np.any(valid_faces_mask):
                     valid_pixel_indices = np.where(valid_faces_mask.reshape(-1))[0]
                     valid_face_values = faces.reshape(-1)[valid_pixel_indices]
                     
-                    # Get vertex indices and normals for valid faces
-                    verts_index = self.tmesh.faces[valid_face_values] # (n_valid, 3)
-                    verts_norms = self.tmesh.vertex_normals[verts_index] # (n_valid, 3, 3)
+                    verts_index = self.tmesh.faces[valid_face_values]
+                    verts_norms = self.tmesh.vertex_normals[verts_index]
                     
-                    # Get barycentric coordinates for valid pixels
-                    valid_bcent = bcent.reshape(-1, 3)[valid_pixel_indices] # (n_valid, 3)
-                    
-                    # Calculate interpolated norms for valid pixels
-                    calculated_norms_flat = np.sum(verts_norms * valid_bcent[:, :, None], axis=1) # (n_valid, 3)
-                    
-                    # Place calculated norms back into the correct spots in the full image array
+                    valid_bcent = bcent.reshape(-1, 3)[valid_pixel_indices]
+                    calculated_norms_flat = np.sum(verts_norms * valid_bcent[:, :, None], axis=1)
                     interpolated_norms.reshape(-1, 3)[valid_pixel_indices] = calculated_norms_flat
 
-            # Use the potentially updated interpolated_norms for diffuse calculation
             diffuse = np.sum(interpolated_norms * lightdir, axis=2)
             diffuse = np.clip(diffuse, -1, 1)
             matte = 255 * (diffuse[:, :, None] * alpha + beta)
@@ -207,7 +181,7 @@ class Renderer:
         depth = render_depth(raw_depth)
         faces = render_faces(raw_faces)
         bcent = render_bcent(raw_bcent)
-        matte = raw_color if uv_map else render_matte(norms, raw_depth, faces, bcent) # use original depth for matte
+        matte = raw_color if uv_map else render_matte(norms, raw_depth, faces, bcent)
 
         return {'norms': norms, 'depth': depth, 'matte': matte, 'faces': faces}
 
@@ -221,8 +195,6 @@ def render_multiview(
     lookat_position=np.array([0, 0, 0]),
     verbose=True,
 ) -> list[Image.Image]:
-    """
-    """
     lookat_position_torch = torch.from_numpy(lookat_position)
     if camera_generation_method == 'sphere':
         views = sample_view_matrices(lookat_position=lookat_position_torch, **sampling_args).numpy()
@@ -230,9 +202,7 @@ def render_multiview(
         views = sample_view_matrices_polyhedra(camera_generation_method, lookat_position=lookat_position_torch, **sampling_args).numpy()
     
     def compute_lightdir(pose: np.ndarray) -> np.ndarray:
-        """
-        """
-        lightdir = pose[:3, 3] - (lookat_position)
+        lightdir = pose[:3, 3] - lookat_position
         return lightdir / np.linalg.norm(lightdir)
 
     renders = []
@@ -246,79 +216,3 @@ def render_multiview(
     return {
         name: [render[name] for render in renders] for name in renders[0].keys()
     }
-
-
-if __name__ == '__main__':
-    from PIL import Image
-    from samesh.data.loaders import read_mesh, read_scene, remove_texture, scene2mesh
-    from samesh.models.shape_diameter_function import shape_diameter_function, colormap_shape_diameter_function, prep_mesh_shape_diameter_function
-
-    '''
-    NOTE:: if you get ctypes.ArgumentError
-
-    https://github.com/mmatl/pyrender/issues/284
-    '''
-    name = 'potion'
-    extension = 'glb'
-    source1 = read_mesh(f'/home/ubuntu/data/BackflipMeshes/{name}.{extension}', norm=True)
-    #source1 = remove_texture(source1, visual_kind='vertex')
-    source1 = prep_mesh_shape_diameter_function(source1)
-    source1 = colormap_shape_diameter_function(source1, shape_diameter_function(source1))
-    source1.export('test_mesh1.glb')
-    source2 = read_scene(f'/home/ubuntu/data/BackflipMeshes/{name}.{extension}', norm=True)
-    #source2 = remove_texture(source2, visual_kind='vertex')
-    source2 = prep_mesh_shape_diameter_function(source2)
-    source2 = colormap_shape_diameter_function(source2, shape_diameter_function(source2))
-    source2.export('test_mesh2.glb')
-    source3 = read_scene('/home/ubuntu/meshseg/tests/examples/valve.glb', norm=True)
-    source3 = remove_texture(source3, visual_kind='vertex') # remove texture for meshlab to export
-    source3 = prep_mesh_shape_diameter_function(source3)
-    source3 = colormap_shape_diameter_function(source3, shape_diameter_function(source3))
-    source3.export('test_mesh3.glb')
-
-    pose = np.array([
-        [ 1,  0,  0,  0],
-        [ 0,  1,  0,  0],
-        [ 0,  0,  1,  2.5],
-        [ 0,  0,  0,  1],
-    ])
-
-    renderer = Renderer(OmegaConf.create({
-        'target_dim': (1024, 1024),
-    }))
-    
-    renderer.set_object(source1)
-    renderer.set_camera()
-    renders = renderer.render(pose)
-    for k, v in renders.items():
-        print(k, v.shape)
-    image = Image.fromarray(renders['matte'])
-    image.save('test_matte_mesh.png')
-    image_faceids = colormap_faces(renders['faces'])
-    image_faceids.save('test_faceids_mesh.png')
-    image_norms = colormap_norms(renders['norms'])
-    image_norms.save('test_norms_mesh.png')
-
-    renderer.set_object(source2, smooth=False)
-    renderer.set_camera()
-    renders = renderer.render(pose, interpolate_norms=True)
-    for k, v in renders.items():
-        print(k, v.shape)
-    image = Image.fromarray(renders['matte'])
-    image.save('test_matte_scene.png')
-    image_faceids = colormap_faces(renders['faces'])
-    image_faceids.save('test_faceids_scene.png')
-    image_norms = colormap_norms(renders['norms'])
-    image_norms.save('test_norms_scene.png')
-
-    renderer.set_object(source3, smooth=False)
-    renderer.set_camera()
-    renders = renderer.render(pose, interpolate_norms=True)
-    for k, v in renders.items():
-        print(k, v.shape)
-    image = Image.fromarray(renders['matte'])
-    image.save('test_matte_objaverse.png')
-    image_faceids = colormap_faces(renders['faces'])
-    image_faceids.save('test_faceids_objaverse.png')
-    image_norms = colormap_norms(renders['norms'])
-    image_norms.save('test_norms_objaverse.png')

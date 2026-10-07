@@ -1,5 +1,11 @@
 import sys
 import os
+
+# Strip EGL environment variables on Windows before any OpenGL or samesh modules are imported
+if sys.platform == "win32" or os.name == "nt":
+    os.environ.pop("PYOPENGL_PLATFORM", None)
+    os.environ.pop("EGL_DEVICE_ID", None)
+
 import json
 import argparse
 from pathlib import Path
@@ -19,30 +25,26 @@ def add_to_path(p):
         sys.path.insert(0, p)
 
 # Add samesh base, src and sam2 to path *before* importing them
-add_to_path(samesh_base_dir) # Add the base directory
+add_to_path(samesh_base_dir)
 add_to_path(samesh_src_dir)
 add_to_path(sam2_dir)
 
-# Add ComfyUI base path if provided (for folder_paths resolution within samesh)
-# This might be needed for implicit dependencies or path lookups within samesh
+# Add ComfyUI base path if provided
 comfyui_base_path = os.environ.get("COMFYUI_BASE_PATH")
 if comfyui_base_path:
     print(f"[SamMesh Worker Init] Adding COMFYUI_BASE_PATH: {comfyui_base_path}")
     add_to_path(comfyui_base_path)
-    # Also try adding the parent of base_path, as sometimes imports expect that structure
     comfyui_parent_path = os.path.dirname(comfyui_base_path)
     print(f"[SamMesh Worker Init] Adding parent of COMFYUI_BASE_PATH: {comfyui_parent_path}")
     add_to_path(comfyui_parent_path)
 else:
-     print("[SamMesh Worker Init] COMFYUI_BASE_PATH not found in environment.")
-
+    print("[SamMesh Worker Init] COMFYUI_BASE_PATH not found in environment.")
 
 # Now import samesh components
 try:
     from omegaconf import OmegaConf
     from samesh.models.sam_mesh import segment_mesh as segment_mesh_samesh_func
     print(f"Worker: Successfully imported samesh modules.")
-    # print(f"Worker sys.path: {sys.path}") # Debug path
 except ImportError as e:
     print(f"Worker Error: Failed to import samesh components. Check paths and dependencies.", file=sys.stderr)
     print(f"Worker sys.path: {sys.path}", file=sys.stderr)
@@ -71,8 +73,7 @@ def main():
     parser.add_argument("--target_labels", type=int, default=-1, help="Target number of labels (-1 to disable).")
     parser.add_argument("--seed", type=int, default=None, help="Optional random seed for reproducibility.")
 
-    # Config overrides (make them optional, provide defaults matching the node if needed)
-    # Defaults should ideally match those in the SamMeshSegmenter node's function signature
+    # Config overrides
     parser.add_argument("--sam_points_per_side", type=int, default=32)
     parser.add_argument("--sam_pred_iou_thresh", type=float, default=0.5)
     parser.add_argument("--sam_stability_score_thresh", type=float, default=0.7)
@@ -84,6 +85,7 @@ def main():
     parser.add_argument("--samesh_smoothing_thresh_perc_area", type=float, default=0.025)
     parser.add_argument("--samesh_smoothing_iterations", type=int, default=64)
     parser.add_argument("--samesh_repartition_lambda", type=int, default=6)
+    # Refiner active (1 iteration)
     parser.add_argument("--samesh_repartition_iterations", type=int, default=1)
 
     args = parser.parse_args()
@@ -96,9 +98,6 @@ def main():
         random.seed(args.seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)
-            # For full reproducibility, you might also need these, but they can impact performance.
-            # torch.backends.cudnn.deterministic = True
-            # torch.backends.cudnn.benchmark = False
         print(f"Worker: Global seed set.")
     else:
         print(f"Worker: No seed provided, results may vary.")
@@ -108,7 +107,7 @@ def main():
     mesh_file_path = Path(args.mesh_path)
     filename_stem = mesh_file_path.stem
 
-    # --- Create configuration directly (similar to the node) ---
+    # --- Create configuration directly ---
     print(f"Worker: Creating samesh config object.")
     try:
         config = OmegaConf.create({
@@ -117,9 +116,9 @@ def main():
             "output": args.output_directory,
             "sam": {
                 "sam": {
-                    "checkpoint": "placeholder.pt", # Will be overridden
-                    "model_config": "placeholder.yaml", # Will be overridden
-                    "auto": True, # Matches original node logic implicitly used by SamModelMesh
+                    "checkpoint": "placeholder.pt",
+                    "model_config": "placeholder.yaml",
+                    "auto": True,
                     "ground": False,
                     "engine_config": {
                         "points_per_side": args.sam_points_per_side,
@@ -131,18 +130,18 @@ def main():
                 }
             },
             "sam_mesh": {
-                "use_modes": ['sdf', 'norms'], # Keep default
+                "use_modes": ['sdf', 'norms'],
                 "min_area": args.samesh_min_area,
+                "face2label_threshold": 16,
                 "connections_bin_resolution": args.samesh_connections_bin_resolution,
                 "connections_bin_threshold_percentage": args.samesh_connections_bin_thresh_perc,
                 "smoothing_threshold_percentage_size": args.samesh_smoothing_thresh_perc_size,
                 "smoothing_threshold_percentage_area": args.samesh_smoothing_thresh_perc_area,
                 "smoothing_iterations": args.samesh_smoothing_iterations,
-                "repartition_cost": 1, # Keep default
+                "repartition_cost": 1,
                 "repartition_lambda": args.samesh_repartition_lambda,
                 "repartition_iterations": args.samesh_repartition_iterations,
             },
-            # Added default renderer config as it's required by SamModelMesh init
             "renderer": {
                 "target_dim": [1024, 1024],
                 "camera_generation_method": "icosahedron",
@@ -156,20 +155,16 @@ def main():
         print(f"Worker: Setting SAM model paths in config.")
         config.sam.sam.checkpoint = args.sam_checkpoint_path
 
-        # Determine the correct config filename from the checkpoint path
         config_filename = os.path.basename(args.sam_model_config_path)
         config.sam.sam.model_config = config_filename
         print(f"Worker: Setting model_config in samesh config to: {config_filename}")
 
-        # Handle target_labels
         target_labels_arg = None if args.target_labels < 0 else args.target_labels
 
-        print(f"Worker: Config prepared:\n{OmegaConf.to_yaml(config)}") # Debug config
+        print(f"Worker: Config prepared:\n{OmegaConf.to_yaml(config)}")
 
         # --- Call the samesh segmentation function ---
         print(f"Worker: Calling samesh.models.sam_mesh.segment_mesh...")
-        # The function saves the mesh and returns the trimesh object. We don't need the object here.
-        # We just need the side effect of the files being created.
         _ = segment_mesh_samesh_func(
             filename=mesh_file_path,
             config=config,
@@ -180,7 +175,7 @@ def main():
         )
         print(f"Worker: samesh function completed.")
 
-        # --- Determine output paths (same logic as in the node) ---
+        # --- Determine output paths ---
         output_mesh_filename = f"{filename_stem}_{args.output_filename_prefix}.{args.output_extension}"
         output_json_filename = f"{filename_stem}_{args.output_filename_prefix}_face2label.json"
         final_output_mesh_path = os.path.join(args.output_directory, output_mesh_filename)
@@ -194,39 +189,35 @@ def main():
         rename_success = True
         if os.path.exists(default_saved_mesh_path):
             try:
-                # --- Add check and removal of destination file ---
                 if os.path.exists(final_output_mesh_path):
                     print(f"Worker: Destination mesh {final_output_mesh_path} exists. Removing before rename.")
                     os.remove(final_output_mesh_path)
-                # -------------------------------------------------
                 os.rename(default_saved_mesh_path, final_output_mesh_path)
                 print(f"Worker: Renamed mesh to {final_output_mesh_path}")
             except Exception as e:
-                 print(f"Worker Error: Failed to rename mesh {default_saved_mesh_path} to {final_output_mesh_path}: {e}", file=sys.stderr)
-                 final_output_mesh_path = f"Error: Failed to rename mesh - {e}"
-                 rename_success = False
+                print(f"Worker Error: Failed to rename mesh {default_saved_mesh_path} to {final_output_mesh_path}: {e}", file=sys.stderr)
+                final_output_mesh_path = f"Error: Failed to rename mesh - {e}"
+                rename_success = False
         else:
-             print(f"Worker Warning: Expected output mesh not found at {default_saved_mesh_path}", file=sys.stderr)
-             final_output_mesh_path = f"Error: Output mesh not found at {default_saved_mesh_path}"
-             rename_success = False
+            print(f"Worker Warning: Expected output mesh not found at {default_saved_mesh_path}", file=sys.stderr)
+            final_output_mesh_path = f"Error: Output mesh not found at {default_saved_mesh_path}"
+            rename_success = False
 
         if os.path.exists(default_saved_json_path):
             try:
-                 # --- Add check and removal of destination file ---
-                 if os.path.exists(final_output_json_path):
-                     print(f"Worker: Destination json {final_output_json_path} exists. Removing before rename.")
-                     os.remove(final_output_json_path)
-                 # -------------------------------------------------
-                 os.rename(default_saved_json_path, final_output_json_path)
-                 print(f"Worker: Renamed json to {final_output_json_path}")
+                if os.path.exists(final_output_json_path):
+                    print(f"Worker: Destination json {final_output_json_path} exists. Removing before rename.")
+                    os.remove(final_output_json_path)
+                os.rename(default_saved_json_path, final_output_json_path)
+                print(f"Worker: Renamed json to {final_output_json_path}")
             except Exception as e:
-                 print(f"Worker Error: Failed to rename JSON {default_saved_json_path} to {final_output_json_path}: {e}", file=sys.stderr)
-                 final_output_json_path = f"Error: Failed to rename JSON - {e}"
-                 rename_success = False
+                print(f"Worker Error: Failed to rename JSON {default_saved_json_path} to {final_output_json_path}: {e}", file=sys.stderr)
+                final_output_json_path = f"Error: Failed to rename JSON - {e}"
+                rename_success = False
         else:
-             print(f"Worker Warning: Expected output json not found at {default_saved_json_path}", file=sys.stderr)
-             final_output_json_path = f"Error: Output JSON not found at {default_saved_json_path}"
-             rename_success = False
+            print(f"Worker Warning: Expected output json not found at {default_saved_json_path}", file=sys.stderr)
+            final_output_json_path = f"Error: Output JSON not found at {default_saved_json_path}"
+            rename_success = False
 
         # Clean up empty subdir
         try:
@@ -235,30 +226,24 @@ def main():
         except OSError as e:
             print(f"Worker Warning: Could not remove empty samesh output directory {output_subdir}: {e}", file=sys.stderr)
 
-
         if not rename_success:
-             print("Worker Error: One or more output files could not be found or renamed.", file=sys.stderr)
-             # Outputting paths even on error might help debugging
-             # sys.exit(1) # Decide if failure to rename should be a fatal error
+            print("Worker Error: One or more output files could not be found or renamed.", file=sys.stderr)
 
         # --- Output paths as JSON to stdout ---
         result = {
             "output_mesh_path": final_output_mesh_path,
             "face2label_path": final_output_json_path
         }
-        # Print status message *before* the JSON
         print("Worker: Segmentation script finished successfully.") 
-        # Print JSON result as the very last line
         print(json.dumps(result))
 
     except ImportError:
-         # Already handled above, but catch again just in case
-         print("Worker Error: Exiting due to import failure.", file=sys.stderr)
-         sys.exit(1)
+        print("Worker Error: Exiting due to import failure.", file=sys.stderr)
+        sys.exit(1)
     except FileNotFoundError as e:
-         print(f"Worker Error: File not found - {e}", file=sys.stderr)
-         traceback.print_exc(file=sys.stderr)
-         sys.exit(1)
+        print(f"Worker Error: File not found - {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
         print(f"Worker Error: An unexpected error occurred during segmentation.", file=sys.stderr)
         print(f"Error details: {e}", file=sys.stderr)
@@ -267,4 +252,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()

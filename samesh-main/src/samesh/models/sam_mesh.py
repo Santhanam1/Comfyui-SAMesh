@@ -5,7 +5,7 @@ import copy
 import multiprocessing as mp
 from collections import defaultdict, Counter
 from pathlib import Path
-import sys # Added for path fix
+import sys
 
 import numpy as np
 import torch
@@ -26,58 +26,32 @@ from samesh.utils.cameras import *
 from samesh.utils.mesh import duplicate_verts
 from samesh.models.shape_diameter_function import *
 
-# --- Worker Initializer for Multiprocessing Path Fix ---
 def _worker_initializer(comfyui_root):
-    """Adds the ComfyUI root directory to sys.path in a worker process."""
-    print(f"[SamMesh Worker Init] Attempting to add path: {comfyui_root}")
-    print(f"[SamMesh Worker Init] sys.path BEFORE: {sys.path}")
+    if sys.platform == "win32" or os.name == "nt":
+        os.environ.pop("PYOPENGL_PLATFORM", None)
+        os.environ.pop("EGL_DEVICE_ID", None)
     try:
         if comfyui_root and comfyui_root not in sys.path:
             sys.path.insert(0, comfyui_root)
-            print(f"[SamMesh Worker Init] Successfully added path.")
-        elif not comfyui_root:
-             print(f"[SamMesh Worker Init] Received empty/None path.")
-        else:
-             print(f"[SamMesh Worker Init] Path already in sys.path.")
     except Exception as e:
         print(f"[SamMesh Worker Init] Error adding ComfyUI root to sys.path: {e}")
-    print(f"[SamMesh Worker Init] sys.path AFTER: {sys.path}")
-# ------------------------------------------------------
 
 def colormap_faces_mesh(mesh: Trimesh, face2label: dict[int, int], background=np.array([0, 0, 0])) -> Trimesh:
-    """
-    """
-    label_max = max(face2label.values())
-    palette = RandomState(0).randint(0, 255, (label_max + 1, 3)) # +1 for unlabeled faces
+    label_max = max(face2label.values()) if face2label else 0
+    palette = RandomState(0).randint(0, 255, (label_max + 1, 3))
     palette[0] = background
-    mesh = duplicate_verts(mesh) # needed to prevent face color interpolation
-    faces_colored = set()
+    mesh = duplicate_verts(mesh)
     for face, label in face2label.items():
-        mesh.visual.face_colors[face, :3] = palette[label]
-        faces_colored.add(face)
-    #print(np.unique(mesh.visual.face_colors, axis=0, return_counts=True))
-    '''
-    for face in range(len(mesh.faces)):
-        if face not in faces_colored:
-            mesh.visual.face_colors[face, :3] = background
-            print('Unlabeled face ', face)
-    '''
+        if face < len(mesh.faces):
+            mesh.visual.face_colors[face, :3] = palette[label]
     return mesh
 
-
 def norms_mask(norms, cam2world, threshold=0.0):
-    """
-    Mask pixels that are directly facing camera
-    """
     lookat = cam2world[:3, :3] @ np.array([0, 0, 1])
     return np.abs(np.dot(norms, lookat)) > threshold
 
-
 def load_items(path: Path) -> dict[str, list]:
-    """
-    """
     print('Loading items from cache...')
-
     filenames = list(path.glob('matte_*.png'))
     filenames = natsorted(filenames, key=lambda x: int(x.stem.split('_')[-1]))
     items = {
@@ -97,18 +71,13 @@ def load_items(path: Path) -> dict[str, list]:
         pass
     return items
 
-
 def save_items(items: dict, path: Path) -> None:
-    """
-    """
     print('Saving items to cache...')
-
     for i, image in enumerate(items['matte']):
         image.save(path / f'matte_{i}.png')
     if 'sdf' in items:
         for i, image in enumerate(items['sdf']):
             image.save(path / f'sdf_{i}.png')
-    
     for i, (faces, bmask, cmask, norms, norms_masked) in enumerate(
         zip(items['faces'], items['bmasks'], items['cmasks'], items['norms'], items['norms_masked'])
     ):
@@ -119,56 +88,43 @@ def save_items(items: dict, path: Path) -> None:
         np.save(path / f'norms_mask_{i}.npy', norms_masked)
     np.save(path / 'poses.npy', items['poses'])
 
-
 def visualize_items(items: dict, path: Path) -> None:
-    """
-    """
     os.makedirs(path, exist_ok=True)
-
     for i, image in tqdm(enumerate(items['matte']), 'Visualizing images'):
         image.save(f'{path}/matte_{i}.png')
     if 'sdf' in items:
         for i, image in tqdm(enumerate(items['sdf']), 'Visualizing SDF'):
             image.save(f'{path}/sdf_{i}.png')
-    
     for i, faces in tqdm(enumerate(items['faces']), 'Visualizing FaceIDs'):
         colormap_faces(faces).save(f'{path}/faces_{i}.png')
     for i, cmask in tqdm(enumerate(items['cmasks']), 'Visualizing SAM Masks'):
-        colormap_mask (cmask).save(f'{path}/masks_{i}.png')
+        colormap_mask(cmask).save(f'{path}/masks_{i}.png')
     for i, norms in tqdm(enumerate(items['norms']), 'Visualizing Normals'):
         colormap_norms(norms).save(f'{path}/norms_{i}.png')
     for i, norms_masked in tqdm(enumerate(items['norms_masked']), 'Visualizing Normals Mask'):
         colormap_norms(norms_masked).save(f'{path}/norms_mask_{i}.png')
 
-
-"""
-Multiprocessing functions SamModelMesh
-"""
 def compute_face2label(
     labels,
     faceid,
     mask,
     norms,
     pose,
-    label_sequence_count: int, threshold_counts: int=16
+    label_sequence_count: int, threshold_counts: int=4
 ):
-    """
-    """
-    #print(f'Computing face2label starting with {label_sequence_count}')
-
     normal_mask = norms_mask(norms, pose)
-
     face2label = defaultdict(Counter)
     for j, label in enumerate(labels):
         label_sequence = label_sequence_count + j
         faces_mask = (mask == label) & normal_mask
-        faces, counts = np.unique(faceid[faces_mask], return_counts=True)
-        faces = faces[counts > threshold_counts]
-        faces = faces[faces != -1] # remove background
-        for face in faces:
-            face2label[int(face)][label_sequence] += np.sum(faces_mask & (faceid == face))
+        masked_faces = faceid[faces_mask]
+        if masked_faces.size == 0:
+            continue
+        faces, counts = np.unique(masked_faces, return_counts=True)
+        valid = (counts > threshold_counts) & (faces != -1)
+        for f, c in zip(faces[valid], counts[valid]):
+            face2label[int(f)][label_sequence] += int(c)
     return face2label
-
 
 def compute_connections(
     i: int, 
@@ -177,31 +133,23 @@ def compute_connections(
     face2label2: dict[int, Counter],
     threshold=32,
 ) -> dict[int, Counter]:
-    """
-    """
-    #print(f'Computing partial connection ratios for {i} and {j}')
-
     connections = defaultdict(Counter)
     face2label1_common = {face: counter.most_common(1)[0][0] for face, counter in face2label1.items()}
     face2label2_common = {face: counter.most_common(1)[0][0] for face, counter in face2label2.items()}
-    for face1, label1 in face2label1_common.items():
-        for face2, label2 in face2label2_common.items():
-            if face1 != face2:
-                continue
-            connections[label1][label2] += 1
-            connections[label2][label1] += 1
-    # remove connections where # overlapping faces is below threshold
+    
+    common_faces = set(face2label1_common.keys()).intersection(face2label2_common.keys())
+    for face in common_faces:
+        label1 = face2label1_common[face]
+        label2 = face2label2_common[face]
+        connections[label1][label2] += 1
+        connections[label2][label1] += 1
+
     for label1, counter in connections.items():
         connections[label1] = {k: v for k, v in counter.items() if v > threshold}
     return connections
 
-
 class SamModelMesh(nn.Module):
-    """
-    """
     def __init__(self, config: OmegaConf, device='cuda', use_sam=True):
-        """
-        """
         super().__init__()
         self.config = config
         self.config.cache = Path(config.cache) if config.cache is not None else None
@@ -210,11 +158,8 @@ class SamModelMesh(nn.Module):
             self.sam = Sam2Model(config.sam, device=device)
 
     def load(self, scene: Scene, mesh_graph=True):
-        """
-        """
         self.renderer.set_object(scene)
         self.renderer.set_camera()
-
         if mesh_graph:
             self.mesh_edges = trimesh.graph.face_adjacency(mesh=self.renderer.tmesh)
             self.mesh_graph = defaultdict(set)
@@ -223,8 +168,6 @@ class SamModelMesh(nn.Module):
                 self.mesh_graph[face2].add(face1)
 
     def render(self, scene: Scene, visualize_path=None) -> dict:
-        """
-        """
         if self.config.cache is not None and self.config.cache.exists():
             if self.config.cache_overwrite:
                 shutil.rmtree(self.config.cache)
@@ -234,7 +177,7 @@ class SamModelMesh(nn.Module):
         def render_func(uv_map=False):
             renderer_args = self.config.renderer.renderer_args.copy()
             if uv_map:
-                renderer_args['uv_map'] = True # handle cases like sdf
+                renderer_args['uv_map'] = True
             return render_multiview(
                 self.renderer,
                 camera_generation_method=self.config.renderer.camera_generation_method,
@@ -244,8 +187,6 @@ class SamModelMesh(nn.Module):
             )
 
         def compute_norms_masked(norms, pose):
-            """
-            """
             valid = norms_mask(norms, pose)
             norms_masked = norms.copy()
             norms_masked[~valid] = np.array([1, 1, 1])
@@ -257,14 +198,12 @@ class SamModelMesh(nn.Module):
         ]
 
         def call_sam(image, mask):
-            """
-            """
-            self.sam.engine.point_grids = \
-                [point_grid_from_mask(mask, self.config.sam.sam.engine_config.points_per_side ** 2)]
+            self.sam.engine.point_grids = [
+                point_grid_from_mask(mask, self.config.sam.sam.engine_config.points_per_side ** 2)
+            ]
             return self.sam(image)
 
         bmasks_list = []
-
         if 'norms' in self.config.sam_mesh.use_modes:
             images1 = [colormap_norms(norms) for norms in renders['norms']]
             bmasks1 = [
@@ -274,7 +213,6 @@ class SamModelMesh(nn.Module):
             bmasks_list.extend(bmasks1)
 
         if 'sdf' in self.config.sam_mesh.use_modes:
-            #scene_sdf = remove_texture(scene)
             tmesh_sdf = prep_mesh_shape_diameter_function(scene)
             tmesh_sdf = colormap_shape_diameter_function(tmesh_sdf, sdf_values=shape_diameter_function(tmesh_sdf))
             self.load(tmesh_sdf)
@@ -288,7 +226,7 @@ class SamModelMesh(nn.Module):
             bmasks_list.extend(bmasks2)
             renders['sdf'] = renders_sdf['matte']
 
-        if 'matte' in self.config.sam_mesh.use_modes: # default matte render
+        if 'matte' in self.config.sam_mesh.use_modes:
             images3 = renders['matte']
             bmasks3 = [
                 call_sam(image, faces != -1) for image, faces in \
@@ -296,7 +234,7 @@ class SamModelMesh(nn.Module):
             ]
             bmasks_list.extend(bmasks3)
 
-        self.load(scene) # restore original scene
+        self.load(scene)
 
         n = len(renders['faces'])
         m = len(bmasks_list) // n
@@ -305,11 +243,10 @@ class SamModelMesh(nn.Module):
             for i in range(n)
         ]
         cmasks = [combine_bmasks(masks, sort=True) for masks in bmasks]
-        # sometimes SAM doesn't separate body from background, so we have extra step to remove background using faceids
         for cmask, faces in zip(cmasks, renders['faces']):
             cmask += 1
             cmask[faces == -1] = 0
-        min_area = self.config.sam_mesh.get('min_area', 1024)
+        min_area = self.config.sam_mesh.get('min_area', 256)
         cmasks = [remove_artifacts(mask, mode='islands', min_area=min_area) for mask in cmasks]
         cmasks = [remove_artifacts(mask, mode='holes'  , min_area=min_area) for mask in cmasks]
         renders['bmasks'] = bmasks
@@ -323,47 +260,39 @@ class SamModelMesh(nn.Module):
         return renders
     
     def lift(self, renders: dict) -> dict:
-        """
-        """
-        # --- Determine ComfyUI root path for worker initializer ---
         comfyui_root_for_workers = None
         try:
             current_dir = os.path.dirname(os.path.abspath(__file__))
             potential_root = os.path.abspath(os.path.join(current_dir, "..", "..", "..", ".."))
             if os.path.basename(potential_root) == 'ComfyUI':
                 comfyui_root_for_workers = potential_root
-                print(f"[SamMesh Lift] Determined ComfyUI root: {comfyui_root_for_workers}") # Debug Print
-            else:
-                print(f"[SamMesh Lift] Calculated path {potential_root} doesn't seem to be ComfyUI root.") # Debug Print
-        except Exception as e:
-            print(f"[SamMesh Lift] Warning: Could not determine ComfyUI root for worker paths: {e}")
-        # ---------------------------------------------------------
+        except Exception:
+            pass
             
         be, en = 0, len(renders['faces'])
         renders = {k: [v[i] for i in range(be, en) if len(v)] for k, v in renders.items()}
 
-        print('Computing face2label for each view on ', mp.cpu_count(), ' cores')
+        worker_cores = int(os.environ.get("SAMESH_NUM_CORES", 2))
+        print(f'Computing face2label for each view on {worker_cores} cores')
         label_sequence_count = 1
         args = []
         for faceid, cmask, norms, pose in zip(renders['faces'], renders['cmasks'], renders['norms'], renders['poses']):
-             labels = np.unique(cmask)
-             labels = labels[labels != 0]
-             args.append((labels, faceid, cmask, norms, pose, label_sequence_count, self.config.sam_mesh.get('face2label_threshold', 16)))
-             label_sequence_count += len(labels)
+            labels = np.unique(cmask)
+            labels = labels[labels != 0]
+            args.append((labels, faceid, cmask, norms, pose, label_sequence_count, self.config.sam_mesh.get('face2label_threshold', 4)))
+            label_sequence_count += len(labels)
 
-        # Use the initializer with the original function
-        with mp.Pool(mp.cpu_count(), initializer=_worker_initializer, initargs=(comfyui_root_for_workers,)) as pool:
+        with mp.Pool(worker_cores, initializer=_worker_initializer, initargs=(comfyui_root_for_workers,)) as pool:
             face2label_views = pool.starmap(compute_face2label, args)
         
-        print('Building match graph on ', mp.cpu_count(), ' cores')
+        print(f'Building match graph on {worker_cores} cores')
         args = []
         for i, face2label1 in enumerate(face2label_views):
-             for j, face2label2 in enumerate(face2label_views):
-                 if i < j:
-                     args.append((i, j, face2label1, face2label2, self.config.sam_mesh.get('connections_threshold', 32)))
+            for j, face2label2 in enumerate(face2label_views):
+                if i < j:
+                    args.append((i, j, face2label1, face2label2, self.config.sam_mesh.get('connections_threshold', 32)))
 
-        # Use the initializer with the original function
-        with mp.Pool(mp.cpu_count(), initializer=_worker_initializer, initargs=(comfyui_root_for_workers,)) as pool:
+        with mp.Pool(worker_cores, initializer=_worker_initializer, initargs=(comfyui_root_for_workers,)) as pool:
             partial_connections = pool.starmap(compute_connections, args)
 
         connections_ratios = defaultdict(Counter)
@@ -371,85 +300,47 @@ class SamModelMesh(nn.Module):
             for label1, counter in c.items():
                 connections_ratios[label1].update(counter)
     
-        # normalize ratios
         for label1, counter in connections_ratios.items():
             total = sum(counter.values())
-            connections_ratios[label1] = {k: v / total for k, v in counter.items()}
+            if total > 0:
+                connections_ratios[label1] = {k: v / total for k, v in counter.items()}
 
-        counter_lens = [len(counter) for counter in connections_ratios.values()]
-        counter_lens = sorted(counter_lens)
-        counter_lens_threshold = max(np.percentile(counter_lens, 95), self.config.sam_mesh.get('counter_lens_threshold_min', 16))
-        print('Counter lens threshold: ', counter_lens_threshold)
-        removed = []
-        for label, counter in connections_ratios.items():
-            if len(counter) > counter_lens_threshold:
-                removed.append(label)
+        counter_lens = sorted([len(counter) for counter in connections_ratios.values()])
+        counter_lens_threshold = max(np.percentile(counter_lens, 95) if counter_lens else 16, self.config.sam_mesh.get('counter_lens_threshold_min', 16))
+        
+        removed = [label for label, counter in connections_ratios.items() if len(counter) > counter_lens_threshold]
         for label in removed:
             connections_ratios.pop(label)
             for counter in connections_ratios.values():
-                if label in counter:
-                    counter.pop(label)
-
-        '''
-        print('Count ratios:')
-        for label1, counter in connections_ratios.items():
-            print(label1)
-            for label2, count in counter.items():
-                print(label2, count)
-        exit()
-        '''
+                counter.pop(label, None)
 
         bins_resolution = self.config.sam_mesh.connections_bin_resolution
         bins = np.zeros(bins_resolution + 1)
         for label1, counter in connections_ratios.items():
-            #print(label1)
             for label2, ratio in counter.items():
-                #print(label2, ratio)
                 bins[int(ratio * bins_resolution)] += 1
-        cutoff = self.config.sam_mesh.connections_bin_threshold_percentage * np.sum(bins) # more connections means higher threshold
-        accum = 0
-        accum_bin = 0
-        while accum < cutoff:
+        cutoff = self.config.sam_mesh.connections_bin_threshold_percentage * np.sum(bins)
+        accum, accum_bin = 0, 0
+        while accum < cutoff and accum_bin < len(bins):
             accum += bins[accum_bin]
             accum_bin += 1
 
-        '''
-        import matplotlib.pyplot as plt
-        plt.clf()
-        plt.bar(range(bins_resolution + 1), bins)
-        plt.xlabel(f'Cutoff bin: {accum_bin}')
-        plt.axvline(x=accum_bin, color='r')
-        plt.savefig(f'ratios_{self.config.cache.stem}.png')
-        '''
-
-        # construct match graph edges
         connections = []
         connections_ratio_threshold = max(accum_bin / bins_resolution, 0.075)
-        print('Connections ratio threshold: ', connections_ratio_threshold)
         for label1, counter in connections_ratios.items():
             for label2, ratio12 in counter.items():
                 ratio21 = connections_ratios[label2][label1]
-                # best buddy match above threshold
-                if ratio12 > connections_ratio_threshold and \
-                   ratio21 > connections_ratio_threshold:
+                if ratio12 > connections_ratio_threshold and ratio21 > connections_ratio_threshold:
                     connections.append((label1, label2))
-        print('Found ', len(connections), ' connections')
     
         connection_graph = igraph.Graph(edges=connections, directed=False)
         connection_graph.simplify()
         communities = connection_graph.community_leiden(resolution_parameter=0)
-        # for comm in communities:
-        #     print(comm)
-        # exit()
         label2label_consistent = {}
-        comm_count = 0
         for comm in communities:
             if len(comm) > 1:
                 label2label_consistent.update({label: comm[0] for label in comm if label != comm[0]})
-                comm_count += 1
-        print('Found ', comm_count, ' communities')
 
-        print('Merging labels')
         face2label_combined = defaultdict(Counter)
         for face2label in face2label_views:
             face2label_combined.update(face2label)
@@ -459,14 +350,12 @@ class SamModelMesh(nn.Module):
             if hook in label2label_consistent:
                 hook = label2label_consistent[hook]
             face2label_consistent[face] = hook
-        #print(sorted(face2label_consistent.values()))
         return face2label_consistent
 
     def smooth(self, face2label_consistent: dict) -> dict:
-        """
-        """
-        # remove holes
         components = self.label_components(face2label_consistent)
+        if not components:
+            return face2label_consistent
 
         threshold_percentage_size = self.config.sam_mesh.smoothing_threshold_percentage_size
         threshold_percentage_area = self.config.sam_mesh.smoothing_threshold_percentage_area
@@ -477,24 +366,15 @@ class SamModelMesh(nn.Module):
         max_size = max([len(comp) for comp in components])
         max_area = max(components_area)
 
-        remove_comp_size = set()
-        remove_comp_area = set()
-        for i, comp in enumerate(components):
-            if len(comp)          < max_size * threshold_percentage_size:
-                remove_comp_size.add(i)
-            if components_area[i] < max_area * threshold_percentage_area:
-                remove_comp_area.add(i)
+        remove_comp_size = {i for i, comp in enumerate(components) if len(comp) < max_size * threshold_percentage_size}
+        remove_comp_area = {i for i, comp in enumerate(components) if components_area[i] < max_area * threshold_percentage_area}
         remove_comp = remove_comp_size.intersection(remove_comp_area)
-        print('Removing ', len(remove_comp), ' components')
         for i in remove_comp:
             for face in components[i]:
-                face2label_consistent.pop(face)
+                face2label_consistent.pop(face, None)
         
-        # fill islands
-        print('Smoothing labels')
         smooth_iterations = self.config.sam_mesh.smoothing_iterations
-        for iteration in range(smooth_iterations):
-            count = 0
+        for _ in range(smooth_iterations):
             changes = {}
             for face in range(len(self.renderer.tmesh.faces)):
                 if face in face2label_consistent:
@@ -506,101 +386,93 @@ class SamModelMesh(nn.Module):
                         if label != 0:
                             labels_adj[label] += 1
                 if len(labels_adj):
-                    count += 1
                     changes[face] = labels_adj.most_common(1)[0][0]
+            if not changes:
+                break
             for face, label in changes.items():
                 face2label_consistent[face] = label
-            #print('Smoothing iteration ', iteration, ' changed ', count, ' faces')
 
         return face2label_consistent
 
-    def split(self, face2label_consistent: dict) -> dict:
-        """
-        """
-        components = self.label_components(face2label_consistent)
+    # Merges tiny disconnected islands into neighboring dominant parts
+    def cleanup_small_components(self, face2label: dict, min_faces: int = 50) -> dict:
+        components = self.label_components(face2label)
+        for comp in components:
+            if len(comp) < min_faces:
+                neighbor_labels = Counter()
+                for face in comp:
+                    for adj in self.mesh_graph[face]:
+                        if adj not in comp and adj in face2label:
+                            neighbor_labels[face2label[adj]] += 1
+                if neighbor_labels:
+                    target_label = neighbor_labels.most_common(1)[0][0]
+                    for face in comp:
+                        face2label[face] = target_label
+        return face2label
 
+    def split(self, face2label_consistent: dict) -> dict:
+        components = self.label_components(face2label_consistent)
         labels_seen = set()
-        labels_curr = max(face2label_consistent.values()) + 1
-        labels_orig = labels_curr
+        labels_curr = (max(face2label_consistent.values()) + 1) if face2label_consistent else 1
         for comp in components:
             face = comp.pop()
             label = face2label_consistent[face]
             comp.add(face)
-            if label == 0 or label in labels_seen: # background or repeated label
+            if label == 0 or label in labels_seen:
                 face2label_consistent.update({face: labels_curr for face in comp})
                 labels_curr += 1
             labels_seen.add(label)
-        print('Split', (labels_curr - labels_orig), 'times') # account for background
-
         return face2label_consistent
 
     def smooth_repartition_faces(self, face2label_consistent: dict, target_labels=None) -> dict:
-        """
-        """
-        # --- Determine ComfyUI root path for worker initializer ---
         comfyui_root_for_workers = None
         try:
             current_dir = os.path.dirname(os.path.abspath(__file__))
             potential_root = os.path.abspath(os.path.join(current_dir, "..", "..", "..", ".."))
             if os.path.basename(potential_root) == 'ComfyUI':
                 comfyui_root_for_workers = potential_root
-                print(f"[SamMesh Repartition] Determined ComfyUI root: {comfyui_root_for_workers}") # Debug Print
-            else:
-                 print(f"[SamMesh Repartition] Calculated path {potential_root} doesn't seem to be ComfyUI root.") # Debug Print
-        except Exception as e:
-            print(f"[SamMesh Repartition] Warning: Could not determine ComfyUI root for worker paths: {e}")
-        # ---------------------------------------------------------
+        except Exception:
+            pass
         
         tmesh = self.renderer.tmesh
-        partition = np.array([face2label_consistent.get(face, 0) for face in range(len(tmesh.faces))]) # Use get for missing faces
-        max_part_label = np.max(partition) if len(partition) > 0 else 0
-        cost_data = np.zeros((len(tmesh.faces), max_part_label + 1))
-        unique_labels = np.unique(partition)
-        for f in range(len(tmesh.faces)):
-            for l in unique_labels:
-                cost_data[f, l] = 0 if partition[f] == l else 1
-        cost_smoothness = -np.log(np.maximum(tmesh.face_adjacency_angles, 1e-20) / np.pi + 1e-20) # Add maximum for safety
+        num_faces = len(tmesh.faces)
+        partition = np.array([face2label_consistent.get(face, 0) for face in range(num_faces)], dtype=np.int64)
+        max_part_label = int(np.max(partition)) if len(partition) > 0 else 0
         
+        cost_data = np.ones((num_faces, max_part_label + 1), dtype=np.float32)
+        cost_data[np.arange(num_faces), partition] = 0.0
+
+        cost_smoothness = -np.log(np.maximum(tmesh.face_adjacency_angles, 1e-20) / np.pi + 1e-20)
         lambda_seed = self.config.sam_mesh.repartition_lambda
 
         try:
-            from .shape_diameter_function import repartition # Corrected import
+            from .shape_diameter_function import repartition
         except ImportError:
-             print("[SamMesh Error] Could not import 'repartition' function.")
-             print("[SamMesh Info] Repartitioning requires additional dependencies or there's an internal path issue. Skipping.")
-             return face2label_consistent # Return the un-repartitioned labels
-        except Exception as e:
-             print(f"[SamMesh Error] Unexpected error during repartition import: {e}")
-             return face2label_consistent
+            return face2label_consistent
+
+        worker_cores = int(os.environ.get("SAMESH_NUM_CORES", 2))
 
         if target_labels is None:
-            # Use the initializer with the original function
-            with mp.Pool(1, initializer=_worker_initializer, initargs=(comfyui_root_for_workers,)) as pool: # Pool of 1 just to use initializer easily
-                 refined_partition = pool.apply(repartition, (tmesh, partition, cost_data, cost_smoothness, self.config.sam_mesh.repartition_iterations, lambda_seed))
-            return {
-                face: refined_partition[face] for face in range(len(tmesh.faces))
-            }
+            with mp.Pool(1, initializer=_worker_initializer, initargs=(comfyui_root_for_workers,)) as pool:
+                refined_partition = pool.apply(repartition, (tmesh, partition, cost_data, cost_smoothness, self.config.sam_mesh.repartition_iterations, lambda_seed))
+            return {face: refined_partition[face] for face in range(num_faces)}
     
-        lambda_range=(
+        lambda_range = (
             self.config.sam_mesh.repartition_lambda_lb, 
             self.config.sam_mesh.repartition_lambda_ub
         )
-        lambdas = np.linspace(*lambda_range, num=max(mp.cpu_count() // 2, 1)) # Ensure at least 1 worker
+        lambdas = np.linspace(*lambda_range, num=worker_cores)
         chunks = [
             (tmesh, partition, cost_data, cost_smoothness, self.config.sam_mesh.repartition_iterations, _lambda) 
             for _lambda in lambdas
         ]
-        # Use the initializer with the original function
-        with mp.Pool(max(mp.cpu_count() // 2, 1), initializer=_worker_initializer, initargs=(comfyui_root_for_workers,)) as pool:
+        with mp.Pool(worker_cores, initializer=_worker_initializer, initargs=(comfyui_root_for_workers,)) as pool:
             refined_partitions = pool.starmap(repartition, chunks)
 
         def compute_cur_labels(part, noise_threshold=10):
-            """
-            """
             values, counts = np.unique(part, return_counts=True)
             return values[counts > noise_threshold]
 
-        # lambda crawling algorithm when target_labels is specified i.e. Princeton Mesh Segmentation Benchmark
         max_iteration = 8
         cur_iteration = 0
         cur_lambda_index = np.searchsorted(lambdas, lambda_seed)
@@ -609,44 +481,39 @@ class SamModelMesh(nn.Module):
             target_labels - self.config.sam_mesh.repartition_lambda_tolerance <= cur_labels and
             target_labels + self.config.sam_mesh.repartition_lambda_tolerance >= cur_labels
         ) and cur_iteration < max_iteration:
-            
             if cur_labels < target_labels and cur_lambda_index > 0:
-                # want more labels so decrease lambda
                 cur_lambda_index -= 1
             if cur_labels > target_labels and cur_lambda_index < len(refined_partitions) - 1:
-                # want less labels so increase lambda
                 cur_lambda_index += 1
-
             cur_labels = len(compute_cur_labels(refined_partitions[cur_lambda_index]))
             cur_iteration += 1
 
-        print('Repartitioned with ', cur_labels, ' labels aiming for ', target_labels, 'target labels using lambda ', lambdas[cur_lambda_index], ' in ', cur_iteration, ' iterations')
-        
         refined_partition = refined_partitions[cur_lambda_index]
-        return {
-            face: refined_partition[face] for face in range(len(tmesh.faces))
-        }
+        return {face: refined_partition[face] for face in range(num_faces)}
 
     def forward(self, scene: Scene, visualize_path=None, target_labels=None) -> tuple:
-        """
-        """
         self.load(scene)
         renders = self.render(scene, visualize_path=visualize_path)
         face2label_consistent = self.lift(renders)
         face2label_consistent = self.smooth(face2label_consistent)
-        # inject unlabeled faces after smoothing
         for face in range(len(self.renderer.tmesh.faces)):
             if face not in face2label_consistent:
                 face2label_consistent[face] = 0
-        face2label_consistent = self.split (face2label_consistent) # needed to label all faces for repartition
-        face2label_consistent = self.smooth_repartition_faces(face2label_consistent, target_labels=target_labels)
-        face2label_consistent = {int(k): int(v) for k, v in face2label_consistent.items()} # ensure serialization
-        assert self.renderer.tmesh.faces.shape[0] == len(face2label_consistent)
+
+        # Eliminate micro-islands before splitting so noise fragments don't multiply into hundreds of labels
+        print("Cleaning up micro-islands before partition refinement...")
+        face2label_consistent = self.cleanup_small_components(face2label_consistent, min_faces=50)
+        face2label_consistent = self.split(face2label_consistent)
+        face2label_consistent = self.cleanup_small_components(face2label_consistent, min_faces=50)
+
+        repartition_iters = getattr(self.config.sam_mesh, 'repartition_iterations', 1)
+        if repartition_iters > 0:
+            face2label_consistent = self.smooth_repartition_faces(face2label_consistent, target_labels=target_labels)
+            
+        face2label_consistent = {int(k): int(v) for k, v in face2label_consistent.items()}
         return face2label_consistent, self.renderer.tmesh
 
     def label_components(self, face2label: dict) -> list[set]:
-        """
-        """
         components = []
         visited = set()
 
@@ -654,7 +521,6 @@ class SamModelMesh(nn.Module):
             stack = [source]
             components.append({source})
             visited.add(source)
-            
             while stack:
                 node = stack.pop()
                 for adj in self.mesh_graph[node]:
@@ -668,7 +534,6 @@ class SamModelMesh(nn.Module):
                 dfs(face)
         return components
 
-
 def segment_mesh(
     filename: str | Path,
     config: OmegaConf,
@@ -677,8 +542,6 @@ def segment_mesh(
     target_labels=None,
     texture=False
 ) -> Trimesh:
-    """
-    """
     print('Segmenting mesh with SAMesh: ', filename)
     filename = Path(filename)
     config = copy.deepcopy(config)
@@ -688,142 +551,33 @@ def segment_mesh(
     model = SamModelMesh(config)
     tmesh = read_mesh(filename, norm=True)
 
-    # --- ADD DEBUG PRINTS HERE ---
-    print("--- DEBUG: After initial read_mesh --- marginalised")
-    if tmesh is None:
-        print("DEBUG: tmesh is None after initial read_mesh")
-    else:
-        print(f"DEBUG: type(tmesh): {type(tmesh)}")
-        if hasattr(tmesh, 'visual'):
-            print(f"DEBUG: type(tmesh.visual): {type(tmesh.visual)}")
-            if hasattr(tmesh.visual, 'defined'):
-                print(f"DEBUG: tmesh.visual.defined: {tmesh.visual.defined}")
-            else:
-                print("DEBUG: tmesh.visual has NO 'defined' attribute.")
-
-            if hasattr(tmesh.visual, 'material'):
-                print(f"DEBUG: type(tmesh.visual.material): {type(tmesh.visual.material)}")
-                if tmesh.visual.material is None:
-                    print("DEBUG: tmesh.visual.material is None")
-                else:
-                    if hasattr(tmesh.visual.material, 'image_texture'):
-                        print(f"DEBUG: TextureVisuals image_texture: {tmesh.visual.material.image_texture}")
-                    if hasattr(tmesh.visual.material, 'baseColorTexture'):
-                        print(f"DEBUG: PBR baseColorTexture: {tmesh.visual.material.baseColorTexture}")
-                    else:
-                        print("DEBUG: PBR material has NO baseColorTexture attribute.")
-            else:
-                print("DEBUG: tmesh.visual has NO material attribute.")
-            
-            if hasattr(tmesh.visual, 'uv'):
-                print(f"DEBUG: tmesh.visual.uv is present, length: {len(tmesh.visual.uv) if tmesh.visual.uv is not None else 'None'}")
-            else:
-                print("DEBUG: tmesh.visual has NO uv attribute.")
-        else:
-            print("DEBUG: tmesh has NO visual attribute.")
-    print("--- END DEBUG ---")
-    # --- END DEBUG PRINTS ---
-
     if not texture:
         tmesh = remove_texture(tmesh, visual_kind='vertex')
     
-    # run sam grounded mesh and optionally visualize renders
     visualize_path = f'{config.output}/{filename.stem}_visualized' if visualize else None
     faces2label, _ = model(tmesh, visualize_path=visualize_path, target_labels=target_labels)
 
-    # colormap and save mesh
     os.makedirs(config.output, exist_ok=True)
-
-    # --- Modified Export Logic ---
     export_path_mesh = config.output / f'{filename.stem}_segmented.{extension}'
     export_path_json = config.output / f'{filename.stem}_face2label.json'
     
-    final_mesh_to_return = None
-
     if texture:
-        # If keeping texture, export the *original* mesh geometry and visuals.
-        # Reload the original mesh cleanly to ensure textures and original state.
-        print("Exporting original mesh with texture.")
-        original_mesh = read_mesh(filename, norm=False, process=False) # Load with minimal processing
+        original_mesh = read_mesh(filename, norm=False, process=False)
         if original_mesh is None:
-             print("Warning: Could not reload original mesh for textured export. Falling back to colored mesh.")
-             # Fallback to exporting the colored mesh if original fails to load
-             tmesh_colored = colormap_faces_mesh(tmesh, faces2label)
-             tmesh_colored.export(export_path_mesh)
-             final_mesh_to_return = tmesh_colored
+            tmesh_colored = colormap_faces_mesh(tmesh, faces2label)
+            tmesh_colored.export(export_path_mesh)
+            final_mesh_to_return = tmesh_colored
         else:
             original_mesh.export(export_path_mesh)
             final_mesh_to_return = original_mesh
     else:
-        # If not keeping texture, export the mesh colored by segment ID.
-        print("Exporting mesh colored by segments.")
         tmesh_colored = colormap_faces_mesh(tmesh, faces2label)
         tmesh_colored.export(export_path_mesh)
         final_mesh_to_return = tmesh_colored
 
-    # Save face to label mapping (always save this)
-    print(f"Saving face-to-label mapping to: {export_path_json}")
     with open(export_path_json, 'w') as f:
-        # Ensure keys and values are basic types for JSON
         faces2label_serializable = {int(k): int(v) for k, v in faces2label.items()}
         json.dump(faces2label_serializable, f)
 
     print(f'Saved SAMesh output to {config.output.parent}/{config.output.name}')
-    
-    if final_mesh_to_return is None:
-         # Should ideally not happen, but have a final fallback
-         print("Error during export selection. Returning initially loaded tmesh.")
-         return tmesh 
-         
-    return final_mesh_to_return # Return the mesh object that was actually exported
-
-
-if __name__ == '__main__':
-    import glob
-    from natsort import natsorted
-
-    def read_filenames(pattern: str):
-        """
-        """
-        filenames = glob.glob(pattern)
-        filenames = map(Path, filenames)
-        filenames = natsorted(list(set(filenames)))
-        print('Segmenting ', len(filenames), ' meshes')
-        return filenames
-
-    filenames = read_filenames('/home/gtangg12/data/samesh/backflip-benchmark-remeshed-processed/*.glb')
-    config = OmegaConf.load('/home/gtangg12/samesh/configs/mesh_segmentation.yaml')
-    for i, filename in enumerate(filenames):
-        segment_mesh(filename, config, visualize=False)
-    
-    config_original = OmegaConf.load('/home/gtangg12/samesh/configs/mesh_segmentation_coseg.yaml')
-    categories = ['candelabra', 'chairs', 'fourleg', 'goblets', 'guitars', 'irons', 'lamps', 'vases']
-    for cat in categories:
-        filenames = read_filenames(f'/home/gtangg12/data/samesh/coseg/{cat}/*.off')
-        for filename in filenames:
-            config = copy.deepcopy(config_original)
-            config.output = Path(config.output) / cat
-            if "cache" in config:
-                config.cache  = Path(config.cache) / cat
-            segment_mesh(filename, config, visualize=False)
-
-    config = OmegaConf.load('/home/gtangg12/samesh/configs/mesh_segmentation_princeton.yaml')
-    filenames = read_filenames('/home/gtangg12/data/samesh/MeshsegBenchmark-1.0/data/off/*.off')
-    for i, filename in enumerate(filenames):
-        name, extension = filename.stem, filename.suffix[1:]
-        category = (int(name) - 1) // 20 + 1
-        if category in [14]: #[4, 8, 13, 14, 17]:
-            continue
-        segment_mesh(filename, config, visualize=False)
-
-    with open('/home/gtangg12/data/samesh/MeshsegBenchmark-1.0/util/parameters/nSeg-ByModel.txt') as f:
-        target_labels_dict = {str(i): int(line) for i, line in enumerate(f.readlines(), 1)}
-    
-    config = OmegaConf.load('/home/gtangg12/samesh/configs/mesh_segmentation_princeton_dynamic.yaml')
-    filenames = read_filenames('/home/gtangg12/data/samesh/MeshsegBenchmark-1.0/data/off/*.off')
-    for i, filename in enumerate(filenames):
-        name, extension = filename.stem, filename.suffix[1:]
-        category = (int(name) - 1) // 20 + 1
-        if category in [14]: #[4, 8, 13, 14, 17]:
-            continue
-        segment_mesh(filename, config, visualize=False, target_labels=target_labels_dict[name])
+    return final_mesh_to_return if final_mesh_to_return is not None else tmesh

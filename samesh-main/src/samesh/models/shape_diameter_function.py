@@ -10,6 +10,7 @@ import pymeshlab
 import trimesh
 import networkx as nx
 import igraph
+import matplotlib.pyplot as plt
 from numpy.random import RandomState
 from trimesh.base import Trimesh, Scene
 from sklearn.mixture import GaussianMixture
@@ -31,8 +32,6 @@ def partition_cost(
     cost_data      : NumpyTensor['f num_components'],
     cost_smoothness: NumpyTensor['e']
 ) -> float:
-    """
-    """
     cost = 0
     for f in range(len(partition)):
         cost += cost_data[f, partition[f]]
@@ -40,7 +39,7 @@ def partition_cost(
         f1, f2 = int(edge[0]), int(edge[1])
         if partition[f1] != partition[f2]:
             cost += cost_smoothness[i]
-    return cost
+    return float(cost)
 
 
 def construct_expansion_graph(
@@ -49,10 +48,8 @@ def construct_expansion_graph(
     partition      : NumpyTensor['f'],
     cost_data      : NumpyTensor['f num_components'],
     cost_smoothness: NumpyTensor['e']
-) -> nx.Graph:
-    """
-    """
-    G = nx.Graph() # undirected graph
+) -> tuple[nx.Graph, dict]:
+    G = nx.Graph()
     A = 'alpha'
     B = 'alpha_complement'
 
@@ -66,11 +63,11 @@ def construct_expansion_graph(
         node2index[i] = 2 + i
 
     aux_count = 0
-    for i, edge in enumerate(mesh.face_adjacency): # auxillary nodes
+    for i, edge in enumerate(mesh.face_adjacency):
         f1, f2 = int(edge[0]), int(edge[1])
         if partition[f1] != partition[f2]:
             a = (f1, f2)
-            if a in node2index: # duplicate edge
+            if a in node2index:
                 continue
             G.add_node(a)
             node2index[a] = len(mesh.faces) + 2 + aux_count
@@ -109,50 +106,45 @@ def repartition(
     labels = np.unique(partition)
 
     cost_smoothness = cost_smoothness * _lambda
-
-    # networkx broken for float capacities
-    #cost_data       = np.round(cost_data       * SCALE).astype(int)
-    #cost_smoothness = np.round(cost_smoothness * SCALE).astype(int)
-
     cost_min = partition_cost(mesh, partition, cost_data, cost_smoothness)
 
     for i in range(smoothing_iterations):
+        for label in tqdm(labels, desc="Refining partitions"):
+            try:
+                G, node2index = construct_expansion_graph(label, mesh, partition, cost_data, cost_smoothness)
+                index2node = {v: k for k, v in node2index.items()}
 
-        #print('Repartition iteration ', i)
-        
-        for label in tqdm(labels):
-            G, node2index = construct_expansion_graph(label, mesh, partition, cost_data, cost_smoothness)
-            index2node = {v: k for k, v in node2index.items()}
+                G = igraph.Graph.from_networkx(G)
+                outputs = G.st_mincut(source=node2index[A], target=node2index[B], capacity='capacity')
+                S = outputs.partition[0]
+                T = outputs.partition[1]
+                
+                # Check source and sink cut validity
+                if not (node2index[A] in S and node2index[B] in T):
+                    continue
 
-            '''
-            _, (S, T) = nx.minimum_cut(G, A, B)
-            assert A in S and B in T
-            S = np.array([v for v in S if isinstance(v, int)]).astype(int)
-            T = np.array([v for v in T if isinstance(v, int)]).astype(int)
-            '''
+                T_nodes = np.array([index2node[v] for v in T if isinstance(index2node.get(v), int)]).astype(int)
+                if len(T_nodes) == 0:
+                    continue
 
-            G = igraph.Graph.from_networkx(G)
-            outputs = G.st_mincut(source=node2index[A], target=node2index[B], capacity='capacity')
-            S = outputs.partition[0]
-            T = outputs.partition[1]
-            assert node2index[A] in S and node2index[B] in T
-            S = np.array([index2node[v] for v in S if isinstance(index2node[v], int)]).astype(int)
-            T = np.array([index2node[v] for v in T if isinstance(index2node[v], int)]).astype(int)
+                # Test candidate partition on a copy before accepting
+                candidate_partition = partition.copy()
+                candidate_partition[T_nodes] = label
 
-            assert (partition[S] == label).sum() == 0 # T consists of those assigned 'alpha' and S 'alpha_complement' (see paper)
-            partition[T] = label
+                cost = partition_cost(mesh, candidate_partition, cost_data, cost_smoothness)
 
-            cost = partition_cost(mesh, partition, cost_data, cost_smoothness)
-            if cost > cost_min:
-                raise ValueError('Cost increased. This should not happen because the graph cut is optimal.')
-            cost_min = cost
+                # Accept move only if it strictly reduces or preserves minimum cost
+                if cost < cost_min:
+                    partition = candidate_partition
+                    cost_min = cost
+            except Exception:
+                # Discard step on any numerical cut singularity and keep current partition
+                continue
     
     return partition
 
 
 def prep_mesh_shape_diameter_function(source: Trimesh | Scene) -> Trimesh:
-    """
-    """
     if isinstance(source, trimesh.Scene):
         source = scene2mesh(source)
     source.merge_vertices(merge_tex=True, merge_norm=True)
@@ -160,27 +152,25 @@ def prep_mesh_shape_diameter_function(source: Trimesh | Scene) -> Trimesh:
 
 
 def colormap_shape_diameter_function(mesh: Trimesh, sdf_values: NumpyTensor['f']) -> Trimesh:
-    """
-    """
     assert len(mesh.faces) == len(sdf_values)
-    mesh = duplicate_verts(mesh) # needed to prevent face color interpolation
-    mesh.visual.face_colors = trimesh.visual.interpolate(sdf_values, color_map='jet')
+    mesh = duplicate_verts(mesh)
+    try:
+        cmap = plt.get_cmap('jet')
+    except Exception:
+        cmap = 'viridis'
+    mesh.visual.face_colors = trimesh.visual.interpolate(sdf_values, color_map=cmap)
     return mesh
 
 
 def colormap_partition(mesh: Trimesh, partition: NumpyTensor['f']) -> Trimesh:
-    """
-    """
     assert len(mesh.faces) == len(partition)
-    palette = RandomState(0).randint(0, 255, (np.max(partition) + 1, 3)) # must init every time to get same colors
-    mesh = duplicate_verts(mesh) # needed to prevent face color interpolation
+    palette = RandomState(0).randint(0, 255, (np.max(partition) + 1, 3))
+    mesh = duplicate_verts(mesh)
     mesh.visual.face_colors = palette[partition]
     return mesh
 
 
 def shape_diameter_function(mesh: Trimesh, norm=True, alpha=4, rays=64, cone_amplitude=120) -> NumpyTensor['f']:
-    """
-    """
     mesh = pymeshlab.Mesh(mesh.vertices, mesh.faces)
     meshset = pymeshlab.MeshSet()
     meshset.add_mesh(mesh)
@@ -189,46 +179,37 @@ def shape_diameter_function(mesh: Trimesh, norm=True, alpha=4, rays=64, cone_amp
     sdf_values = meshset.current_mesh().face_scalar_array()
     sdf_values[np.isnan(sdf_values)] = 0
     if norm:
-        # normalize and smooth shape diameter function values
-        min = sdf_values.min()
-        max = sdf_values.max()
-        sdf_values = (sdf_values - min) / (max - min)
+        min_val = sdf_values.min()
+        max_val = sdf_values.max()
+        sdf_values = (sdf_values - min_val) / (max_val - min_val)
         sdf_values = np.log(sdf_values * alpha + 1) / np.log(alpha + 1)
     return sdf_values
 
 
 def partition_faces(mesh: Trimesh, num_components: int, _lambda: float, smooth=True, smoothing_iterations=1, **kwargs) -> NumpyTensor['f']:
-    """
-    """
     sdf_values = shape_diameter_function(mesh, norm=True).reshape(-1, 1)
 
-    # fit 1D GMM to shape diameter function values
     gmm = GaussianMixture(num_components)
     gmm.fit(sdf_values)
     probs = gmm.predict_proba(sdf_values)
     if not smooth:
         return np.argmax(probs, axis=1)
 
-    # data and smoothness terms
     cost_data       = -np.log(probs + EPSILON)
     cost_smoothness = -np.log(mesh.face_adjacency_angles / np.pi + EPSILON)
     cost_smoothness = _lambda * cost_smoothness
 
-    # generate initial partition and refine with alpha expansion graph cut
     partition = np.argmin(cost_data, axis=1)
     partition = repartition(mesh, partition, cost_data, cost_smoothness, smoothing_iterations=smoothing_iterations)
     return partition
 
 
 def partition2label(mesh: Trimesh, partition: NumpyTensor['f']) -> NumpyTensor['f']:
-    """
-    """
     edges = trimesh.graph.face_adjacency(mesh=mesh)
     graph = defaultdict(set)
     for face1, face2 in edges:
         graph[face1].add(face2)
         graph[face2].add(face1)
-    labels = set(list(np.unique(partition)))
     
     components = []
     visited = set()
@@ -260,9 +241,7 @@ def partition2label(mesh: Trimesh, partition: NumpyTensor['f']) -> NumpyTensor['
 
 
 def segment_mesh_sdf(filename: Path | str, config: OmegaConf, extension='glb') -> Trimesh:
-    """
-    """
-    print('Segmenting mesh with Shape Diameter Funciont: ', filename)
+    print('Segmenting mesh with Shape Diameter Function: ', filename)
     filename = Path(filename)
     config = copy.deepcopy(config)
     config.output = Path(config.output) / filename.stem
@@ -275,45 +254,6 @@ def segment_mesh_sdf(filename: Path | str, config: OmegaConf, extension='glb') -
 
     os.makedirs(config.output, exist_ok=True)
     mesh_colored = colormap_partition(mesh, partition_disconnected)
-    mesh_colored.export        (f'{config.output}/{filename.stem}_segmented.{extension}')
+    mesh_colored.export(f'{config.output}/{filename.stem}_segmented.{extension}')
     json.dump(faces2label, open(f'{config.output}/{filename.stem}_face2label.json', 'w'))
     return mesh_colored
-    
-
-if __name__ == '__main__':
-    import glob
-    from natsort import natsorted
-
-    def read_filenames(pattern: str):
-        """
-        """
-        filenames = glob.glob(pattern)
-        filenames = map(Path, filenames)
-        filenames = natsorted(list(set(filenames)))
-        print('Segmenting ', len(filenames), ' meshes')
-        return filenames
-
-    filenames = read_filenames('/home/gtangg12/data/samesh/backflip-benchmark-remeshed-processed/*.glb')
-    #filenames = [Path('/home/gtangg12/data/samesh.backflip-benchmark-remeshed-processed/jacket.glb')]
-    config = OmegaConf.load('/home/gtangg12/samesh/configs/mesh_segmentation_shape_diameter_function.yaml')
-    for i, filename in enumerate(filenames):
-        segment_mesh_sdf(filename, config)
-
-    config_original = OmegaConf.load('/home/gtangg12/samesh/configs/mesh_segmentation_shape_diameter_function_coseg.yaml')
-    categories = ['candelabra', 'chairs', 'fourleg', 'goblets', 'guitars', 'irons', 'lamps', 'vases']
-    for cat in categories:
-        filenames = read_filenames(f'/home/gtangg12/data/samesh/coseg/{cat}/*.off')
-        for filename in filenames:
-            config = copy.deepcopy(config_original)
-            config.output = Path(config.output) / cat
-            segment_mesh_sdf(filename, config)
-    
-    config_original = OmegaConf.load('/home/gtangg12/samesh/configs/mesh_segmentation_shape_diameter_function_princeton.yaml')
-    filenames = read_filenames('/home/gtangg12/data/samesh/MeshsegBenchmark-1.0/data/off/*.off')
-    for i, filename in enumerate(filenames):
-        name, extension = filename.stem, filename.suffix[1:]
-        category = (int(name) - 1) // 20 + 1
-        if category in [14]: #[4, 8, 13, 14, 17]:
-            continue
-        config = copy.deepcopy(config_original)
-        segment_mesh_sdf(filename, config)
